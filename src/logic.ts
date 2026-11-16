@@ -1,11 +1,11 @@
 export type LeaveType = { id: string; name: string; emoji: string; color: string; quota: number;
-  accrual: 'monthly' | 'upfront'; carryCap: number; unpaid?: boolean };
-export type Entry = { id: string; typeId: string; start: string; end: string; half?: boolean; reason: string; notes?: string; skipWeekends?: boolean };
-export type Settings = { cycleStart: number; cycleDay: number; skipWeekends: boolean; accent: string };
+  accrual: 'monthly' | 'upfront'; carryCap: number; unpaid?: boolean; borrow?: number };
+export type Entry = { id: string; typeId: string; start: string; end: string; half?: boolean; reason: string; notes?: string; borrow?: boolean; skipWeekends?: boolean };
+export type Settings = { cycleStart: number; cycleDay: number; skipWeekends: boolean; accent: string; sandwich: boolean; holidays: string[] };
 export type Data = { v: number; settings: Settings; types: LeaveType[]; entries: Entry[] };
-export type Sum = { credited: number; used: number; carry: number; balance: number; total: number; lwp: number };
+export type Sum = { credited: number; used: number; carry: number; balance: number; total: number; lwp: number; borrowed: number };
 
-export const DEFAULT: Data = { v: 1, settings: { cycleStart: 0, cycleDay: 1, skipWeekends: true, accent: '#c5a059' }, entries: [], types: [
+export const DEFAULT: Data = { v: 1, settings: { cycleStart: 0, cycleDay: 1, skipWeekends: true, accent: '#c5a059', sandwich: false, holidays: [] }, entries: [], types: [
   { id: 'apl', name: 'Annual Paid Leave', emoji: '🌴', color: '#c5a059', quota: 30, accrual: 'monthly', carryCap: 0 },
   { id: 'lwp', name: 'Leave Without Pay', emoji: '🌫️', color: '#8a8a99', quota: 0, accrual: 'upfront', carryCap: 0, unpaid: true } ] };
 
@@ -17,8 +17,8 @@ export const fmtD = (s: string) => { const d = P(s); return `${d.getDate()} ${MO
 
 type DE = Pick<Entry, 'start' | 'end' | 'half' | 'skipWeekends'>;
 export function dayList(e: DE, s: Settings): Date[] {
-  const out: Date[] = [], skip = e.skipWeekends ?? s.skipWeekends, end = P(e.end);
-  for (const d = P(e.start); d <= end; d.setDate(d.getDate() + 1)) { const w = d.getDay(); if (!(skip && (w === 0 || w === 6))) out.push(new Date(d)); }
+  const hol = new Set(s.holidays || []), out: Date[] = [], skip = e.skipWeekends ?? s.skipWeekends, end = P(e.end);
+  for (const d = P(e.start); d <= end; d.setDate(d.getDate() + 1)) { const w = d.getDay(); if (!(skip && (w === 0 || w === 6 || hol.has(iso(d))))) out.push(new Date(d)); }
   return out;
 }
 export const days = (e: DE, s: Settings) => e.half ? 0.5 : dayList(e, s).length;
@@ -32,16 +32,24 @@ export function compute(d: Data, today = new Date()) {
   type Part = { c: number; n: number; first: Date };
   const parts: Record<string, Part[]> = {}, monthly: Record<number, number[]> = {};
   let gFirst = cur, gLast = cur;
-  for (const e of d.entries) {
-    const m = new Map<number, Part>();
-    for (const dt of e.half ? [P(e.start)] : dayList(e, S)) {
-      const c = cyc(dt), n = e.half ? 0.5 : 1, p = m.get(c) || { c, n: 0, first: dt };
-      p.n += n; m.set(c, p);
-      const i = idx(dt); (monthly[c] ||= Array(12).fill(0))[i - c * 12] += n;
+  const charged: { dt: Date; e: Entry; n: number }[] = [];
+  for (const e of d.entries) { parts[e.id] = []; for (const dt of e.half ? [P(e.start)] : dayList(e, S)) charged.push({ dt, e, n: e.half ? 0.5 : 1 }); }
+  if (S.sandwich) { // weekends/holidays lying between two leave days are charged as leave too
+    const hol = new Set(S.holidays || []), off = (x: Date) => x.getDay() === 0 || x.getDay() === 6 || hol.has(iso(x));
+    const sorted = [...charged].sort((a, b) => +a.dt - +b.dt);
+    for (let i = 0; i + 1 < sorted.length; i++) {
+      const a = sorted[i], b = sorted[i + 1], gap: Date[] = [], x = new Date(a.dt); x.setDate(x.getDate() + 1);
+      while (x < b.dt) { gap.push(new Date(x)); x.setDate(x.getDate() + 1); }
+      if (gap.length && gap.every(off)) gap.forEach(g => charged.push({ dt: g, e: a.e, n: 1 }));
     }
-    parts[e.id] = [...m.values()];
-    parts[e.id].forEach(p => { gFirst = Math.min(gFirst, p.c); gLast = Math.max(gLast, p.c); });
   }
+  const pm = new Map<string, Part>();
+  for (const { dt, e, n } of charged) {
+    const i = idx(dt), c = Math.floor(i / 12), k = e.id + '|' + c, p = pm.get(k) || { c, n: 0, first: dt };
+    p.n += n; if (dt < p.first) p.first = dt; pm.set(k, p);
+    (monthly[c] ||= Array(12).fill(0))[i - c * 12] += n; gFirst = Math.min(gFirst, c); gLast = Math.max(gLast, c);
+  }
+  pm.forEach((p, k) => parts[k.slice(0, k.lastIndexOf('|'))].push(p));
   const split: Record<string, { paid: number; lwp: number }> = {}, sum: Record<string, Record<number, Sum>> = {}, lwp: Record<number, number> = {};
   d.entries.forEach(e => split[e.id] = { paid: 0, lwp: 0 });
   const r6 = (x: number) => Math.round(x * 1e6) / 1e6;
@@ -54,11 +62,12 @@ export function compute(d: Data, today = new Date()) {
       let used = 0, over = 0;
       for (const it of items) {
         if (t.unpaid) { split[it.e.id].lwp += it.n; over += it.n; continue; }
-        const paid = Math.min(it.n, Math.max(0, r6(carry + credit(idx(it.first)) - used)));
+        const avail = Math.min(carry + credit(idx(it.first)) + (it.e.borrow ? (t.borrow || 0.5) : 0), carry + t.quota) - used;
+        const paid = Math.min(it.n, Math.max(0, r6(avail)));
         split[it.e.id].paid += paid; split[it.e.id].lwp += it.n - paid; used += paid; over += it.n - paid;
       }
       const cr = t.unpaid ? 0 : carry + credit(tIdx);
-      sum[t.id][c] = { credited: cr, used, carry, balance: Math.max(0, cr - used), total: t.unpaid ? 0 : carry + t.quota, lwp: over };
+      sum[t.id][c] = { credited: cr, used, carry, balance: Math.max(0, cr - used), total: t.unpaid ? 0 : carry + t.quota, lwp: over, borrowed: Math.max(0, r6(used - cr)) };
       lwp[c] = (lwp[c] || 0) + over;
       if (!t.unpaid) carry = Math.min(Math.max(0, carry + t.quota - used), t.carryCap);
     }
@@ -85,6 +94,7 @@ export function migrate(raw: any): Data {
   const d = raw && typeof raw === 'object' ? raw : {};
   if (Array.isArray(d) || Array.isArray(d.leaveEntries)) return fromLegacy(d);
   const st = { ...DEFAULT.settings, ...(d.settings || {}) };
+  st.holidays = Array.isArray(st.holidays) ? st.holidays.filter((h: any) => typeof h === 'string') : [];
   st.cycleDay = inr(st.cycleDay, 1, 28, 1); st.cycleStart = inr(st.cycleStart, 0, 11, 0);
   return { v: 1, settings: st, types: Array.isArray(d.types) && d.types.length ? d.types : DEFAULT.types,
     entries: Array.isArray(d.entries) ? d.entries.filter((e: any) => e && e.start && e.end && e.typeId) : [] };

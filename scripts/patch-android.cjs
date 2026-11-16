@@ -13,3 +13,11 @@ g = g.replace(/versionCode\s+\d+/, `versionCode ${process.env.VERSION_CODE || 1}
     }
     buildTypes {`);
 fs.writeFileSync(p, g);
+
+// App icon + splash (pre-rendered in /icons)
+const res = 'android/app/src/main/res';
+for (const dens of fs.readdirSync('icons').filter(x => x !== 'splash'))
+  for (const f of fs.readdirSync(`icons/${dens}`)) fs.copyFileSync(`icons/${dens}/${f}`, `${res}/mipmap-${dens}/${f}`);
+for (const f of fs.readdirSync('icons/splash')) fs.copyFileSync(`icons/splash/${f}/splash.png`, `${res}/${f}/splash.png`);
+fs.writeFileSync(`${res}/values/ic_launcher_background.xml`,
+  '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#0B0B10</color>\n</resources>\n');

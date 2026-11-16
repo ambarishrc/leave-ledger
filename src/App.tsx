@@ -26,6 +26,7 @@ export default function App() {
   const [q, setQ] = useState('');
   const [msg, setMsg] = useState('');
   const [paste, setPaste] = useState(false);
+  const [hd, setHd] = useState('');
   const [vc, setVc] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
   useEffect(() => { load().then(setD); }, []);
@@ -61,7 +62,8 @@ export default function App() {
             <div className="grow"><h3>{t.emoji} {t.name}</h3>
               <p>{n1(s.used)} used of {n1(s.credited)} earned so far</p>
               <p className="dim">{t.accrual === 'monthly' ? `+${n1(t.quota / 12)}/month · ` : ''}{n1(s.total)} this year{s.carry > 0 ? ` (incl. ${n1(s.carry)} carried)` : ''}</p>
-              {s.lwp > 0 && <span className="pill warn">{n1(s.lwp)} days became LWP</span>}</div></div>); })}
+              {s.lwp > 0 && <span className="pill warn">{n1(s.lwp)} days became LWP</span>}
+              {s.borrowed > 0.001 && <span className="pill">{n1(s.borrowed)} borrowed from next month</span>}</div></div>); })}
         {lw > 0 && <div className="card lwp"><span>🌫️</span><div className="grow"><b>{n1(lw)} days without pay</b><small>this cycle, counted automatically</small></div></div>}
         <h4>Month by month</h4>
         <div className="mstrip">{Array.from({ length: 12 }, (_, i) => { const u = res.monthly[cv]?.[i] || 0;
@@ -95,7 +97,13 @@ export default function App() {
           <select className="in" value={d.settings.cycleDay} onChange={e => commit({ ...d, settings: { ...d.settings, cycleDay: +e.target.value } })}>
             {Array.from({ length: 28 }, (_, i) => <option key={i} value={i + 1}>Day {i + 1}</option>)}</select>
           <label>Accent colour</label><div className="chips sw">{COLORS.map(c => <button key={c} className={d.settings.accent === c ? 'on' : ''} style={{ background: c }} onClick={() => commit({ ...d, settings: { ...d.settings, accent: c } })} />)}</div>
-          <label className="tog"><input type="checkbox" checked={d.settings.skipWeekends} onChange={e => commit({ ...d, settings: { ...d.settings, skipWeekends: e.target.checked } })} /> Skip Sat/Sun by default (changeable per leave)</label></div>
+          <label className="tog"><input type="checkbox" checked={d.settings.skipWeekends} onChange={e => commit({ ...d, settings: { ...d.settings, skipWeekends: e.target.checked } })} /> Skip weekends &amp; holidays by default</label></div>
+        <div className="card"><label className="tog"><input type="checkbox" checked={d.settings.sandwich} onChange={e => commit({ ...d, settings: { ...d.settings, sandwich: e.target.checked } })} /> Sandwich rule</label>
+          <small>Weekends and holidays between two leave days count as leave too (e.g. Fri + Mon = 4 days).</small>
+          <label>Holidays</label>
+          <div className="two"><input className="in" type="date" value={hd} onChange={e => setHd(e.target.value)} />
+            <button className="btn ghost" style={{ margin: '4px 0 10px', flex: '0 0 90px' }} onClick={() => { if (hd && !d.settings.holidays.includes(hd)) { commit({ ...d, settings: { ...d.settings, holidays: [...d.settings.holidays, hd].sort() } }); setHd(''); } }}>Add</button></div>
+          <div className="chips">{d.settings.holidays.map(h => <button key={h} onClick={() => commit({ ...d, settings: { ...d.settings, holidays: d.settings.holidays.filter(x => x !== h) } })}>{fmtD(h)} '{h.slice(2, 4)} ✕</button>)}</div></div>
         <div className="card"><b>Backup</b><small>Updates never erase data, but keep a copy anyway.</small>
           <button className="btn" onClick={() => exportData(d).catch(() => toast('Export failed'))}>⬆️ Export backup</button>
           <label className="btn ghost">⬇️ Import backup<input hidden type="file" accept=".json,application/json" onChange={async e => {
@@ -126,25 +134,33 @@ export default function App() {
 function EntrySheet({ d, e, onClose, onSave, onDel }: { d: Data; e: Partial<Entry>; onClose: () => void; onSave: (e: Entry) => void; onDel: (id: string) => void }) {
   const t0 = iso(new Date());
   const [f, setF] = useState<Entry>({ id: e.id || '', typeId: e.typeId || d.types.find(t => !t.unpaid)?.id || d.types[0].id,
-    start: e.start || t0, end: e.end || e.start || t0, half: !!e.half, reason: e.reason || '', notes: e.notes || '', skipWeekends: e.skipWeekends ?? d.settings.skipWeekends });
+    start: e.start || t0, end: e.end || e.start || t0, half: !!e.half, reason: e.reason || '', notes: e.notes || '', borrow: !!e.borrow, skipWeekends: e.skipWeekends ?? d.settings.skipWeekends });
+  const bt = T(d, f.typeId), canBorrow = !!bt && !bt.unpaid && bt.accrual === 'monthly';
   const clash = d.entries.find(x => x.id !== f.id && x.start <= f.end && f.start <= x.end);
   const set = (p: Partial<Entry>) => setF(x => { const n = { ...x, ...p }; if (n.end < n.start) n.end = n.start; if (n.start !== n.end) n.half = false; return n; });
-  const prev = useMemo(() => { const id = f.id || '__new'; const r = compute({ ...d, entries: [...d.entries.filter(x => x.id !== f.id), { ...f, id }] });
-    return { n: days(f, d.settings), s: r.split[id] }; }, [f, d]);
+  const prev = useMemo(() => {
+    const others = d.entries.filter(x => x.id !== f.id);
+    const tot = (en: Entry[]) => { const r = compute({ ...d, entries: en }); let p = 0, l = 0; en.forEach(x => { p += r.split[x.id].paid; l += r.split[x.id].lwp; }); return [p, l]; };
+    const [p1, l1] = tot([...others, { ...f, id: f.id || '__new' }]), [p0, l0] = tot(others), n = days(f, d.settings), total = p1 + l1 - p0 - l0;
+    return { n, paid: p1 - p0, lwp: l1 - l0, total, extra: Math.max(0, total - n) };
+  }, [f, d]);
   return <Sheet title={e.id ? 'Edit leave' : 'Log a leave'} onClose={onClose}>
     <div className="chips">{d.types.map(t => <button key={t.id} className={f.typeId === t.id ? 'on' : ''} style={f.typeId === t.id ? { background: t.color, color: '#000' } : {}} onClick={() => set({ typeId: t.id })}>{t.emoji} {t.name}</button>)}</div>
     <div className="two"><div><label>From</label><input className="in" type="date" value={f.start} onChange={x => x.target.value && set({ start: x.target.value })} /></div>
       <div><label>To</label><input className="in" type="date" value={f.end} min={f.start} onChange={x => x.target.value && set({ end: x.target.value })} /></div></div>
     {f.start === f.end && <label className="tog"><input type="checkbox" checked={!!f.half} onChange={x => set({ half: x.target.checked })} /> Half day</label>}
     {!f.half && <label className="tog"><input type="checkbox" checked={f.skipWeekends !== false} onChange={x => set({ skipWeekends: x.target.checked })} /> Skip weekends</label>}
+    {canBorrow && <><label className="tog"><input type="checkbox" checked={!!f.borrow} onChange={x => set({ borrow: x.target.checked })} /> HR approved: adjust shortfall against next month</label>
+      <small>Up to {n1(bt!.borrow || 0.5)} day(s). Leave unticked and any shortfall becomes LWP.</small></>}
     <label>Why?</label><input className="in" placeholder="Reason (optional)" value={f.reason} onChange={x => set({ reason: x.target.value })} />
     <div className="chips">{REASONS.map(r => <button key={r} onClick={() => set({ reason: r })}>{r}</button>)}</div>
     <input className="in" placeholder="Notes (optional)" value={f.notes || ''} onChange={x => set({ notes: x.target.value })} />
     {clash && <p className="err">Overlaps your leave on {fmtD(clash.start)}{clash.start !== clash.end && ` → ${fmtD(clash.end)}`} — edit that one instead.</p>}
-    <div className={'card prev' + (prev.s?.lwp ? ' warnbox' : '')}><b>{n1(prev.n)} day{prev.n === 1 ? '' : 's'}</b>
-      {prev.s && !T(d, f.typeId)?.unpaid && <span> → {n1(prev.s.paid)} paid{prev.s.lwp > 0 && <> + <b>{n1(prev.s.lwp)} LWP</b> (balance ran out)</>}</span>}
+    <div className={'card prev' + (prev.lwp > 0.001 ? ' warnbox' : '')}><b>{n1(prev.total)} day{prev.total === 1 ? '' : 's'}</b>
+      {prev.extra > 0.001 && <span> (incl. {n1(prev.extra)} sandwiched)</span>}
+      {!T(d, f.typeId)?.unpaid && <span> → {n1(prev.paid)} paid{prev.lwp > 0.001 && <> + <b>{n1(prev.lwp)} LWP</b> (balance ran out)</>}</span>}
       {prev.n === 0 && <span> — no working days in this range</span>}</div>
-    <button className="btn" disabled={prev.n === 0 || !!clash} onClick={() => onSave({ ...f, id: f.id || uid() })}>Save</button>
+    <button className="btn" disabled={prev.n === 0 || !!clash} onClick={() => onSave({ ...f, borrow: canBorrow && !!f.borrow, id: f.id || uid() })}>Save</button>
     {e.id && <button className="btn danger" onClick={() => onDel(e.id!)}>Delete</button>}
   </Sheet>;
 }
@@ -160,7 +176,9 @@ function TypeSheet({ t, onClose, onSave, onDel }: { t: LeaveType; onClose: () =>
     {!f.unpaid && <>
       <div className="two"><div><label>Days per year</label><input className="in" type="number" min={0} step="0.5" value={f.quota} onChange={x => set({ quota: Math.max(0, +x.target.value) })} /></div>
         <div><label>Carry over (max)</label><input className="in" type="number" min={0} value={f.carryCap} onChange={x => set({ carryCap: Math.max(0, +x.target.value) })} /></div></div>
-      <label>Credited</label><div className="chips">{(['monthly', 'upfront'] as const).map(a => <button key={a} className={f.accrual === a ? 'on' : ''} onClick={() => set({ accrual: a })}>{a === 'monthly' ? 'Monthly (quota ÷ 12)' : 'All at start of year'}</button>)}</div></>}
+      <label>Credited</label><div className="chips">{(['monthly', 'upfront'] as const).map(a => <button key={a} className={f.accrual === a ? 'on' : ''} onClick={() => set({ accrual: a })}>{a === 'monthly' ? 'Monthly (quota ÷ 12)' : 'All at start of year'}</button>)}</div>
+      {f.accrual === 'monthly' && <><label>Max you can borrow (needs HR approval)</label><div className="chips">{[0.5, 1, 2].map(b => <button key={b} className={(f.borrow || 0.5) === b ? 'on' : ''} onClick={() => set({ borrow: b })}>{`Up to ${b}`}</button>)}</div>
+        <small>Never automatic: you tick it on a leave only when HR has approved adjusting the shortfall against next month.</small></>}</>}
     <button className="btn" disabled={!f.name.trim()} onClick={() => onSave({ ...f, name: f.name.trim() })}>Save</button>
     {t.id && <button className="btn danger" onClick={() => onDel(t.id)}>Delete</button>}
   </Sheet>;
